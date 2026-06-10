@@ -1,10 +1,12 @@
 > Configure Vertex AI or your own API credentials in the Settings page before using the agent.
 # CoComputer: The Autonomous Cloud Desktop Agent
 
+## Access here : [https://nexus-frontend-5mrr4rm3eq-uc.a.run.app/]
+
 CoComputer is a state-of-the-art, voice-enabled autonomous agent designed to navigate, control, and execute complex workflows within a secure, persistent cloud-based desktop environment. Powered by the latest **Gemini** models through **Google Vertex AI**, CoComputer bridges the gap between conversational AI and real-world task execution.
 
 ## 🚀 Project Highlights
-- **Leverages Gemini 3.1 Pro, 3.0 Flash Preview Models and gemini flash native 2.5** for reasoning, vision, and voice.
+- **Leverages Gemini 3.1 Pro, 3.0 Flash Preview Models** for reasoning, vision, and voice.
 - **Built with the Google GenAI SDK** for seamless integration with Vertex AI endpoints.
 - **Powered by Google Cloud Services**, including Cloud Run (Serverless Compute), Artifact Registry, and Secret Manager.
 - **Secure Sandbox Execution** using E2B Desktop Sandboxes for safe, isolated code and browser operations.
