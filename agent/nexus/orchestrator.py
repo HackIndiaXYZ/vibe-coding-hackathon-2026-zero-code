@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Agentic Company. All rights reserved.
+# Proprietary and non-commercial use only.
+
 """Orchestrator — wires voice → agent → sandbox → vision → response."""
 
 from __future__ import annotations
@@ -8,9 +11,11 @@ from datetime import datetime, timezone
 import hashlib
 import logging
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import httpx
+from google.adk.events import Event
+from google.genai import types
 from starlette.websockets import WebSocket, WebSocketState
 
 from nexus.agent import AgentTurnResult, create_agent, create_multi_agent, create_runner, run_agent_turn
@@ -25,14 +30,17 @@ from nexus.tools._context import (
     set_bg_task_manager,
     set_history_repository,
     set_owner_id,
+    set_production_task_repository,
     set_run_id,
     set_runtime_config,
     set_sandbox,
     set_send_json,
     set_session_id,
+    set_task_id,
     set_workspace_path,
 )
 from nexus.config import settings
+from nexus.event_sink import CompositeEventSink, build_session_event_sink
 from nexus.fast_lookup import cache_key, get_cached_value, set_cached_value
 from nexus.prompts.system import SYSTEM_PROMPT, VOICE_SYSTEM_PROMPT
 from nexus.routing import build_current_lookup_queries, classify_request, extract_search_query
@@ -47,6 +55,7 @@ from nexus.tools.workspace import (
 from nexus.usage import TokenUsageRecord, extract_token_usage_records
 
 if TYPE_CHECKING:
+    from nexus.production_tasks import ProductionTaskRepository
     from nexus.session import Session
 
 logger = logging.getLogger(__name__)
@@ -68,6 +77,8 @@ class NexusOrchestrator:
         session: "Session",
         ws: WebSocket,
         history_repository: FirestoreHistoryRepository | None = None,
+        production_task_repository: "ProductionTaskRepository | None" = None,
+        ensure_sandbox_ready: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.session = session
         self.ws = ws
@@ -79,6 +90,19 @@ class NexusOrchestrator:
         self._voice_reconnect_task: asyncio.Task | None = None
         self._voice_connection_error_cls: type[Exception] | None = None
         self.history_repository = history_repository
+        self.production_task_repository = production_task_repository
+        self._ensure_sandbox_ready_callback = ensure_sandbox_ready
+        self._sandbox_ready_reported = bool(session.stream_url)
+        self._current_run_id = session.current_run_id
+        self._durable_task_id = self._resolve_durable_task_id()
+        self._durable_run_id = self._resolve_durable_run_id()
+        self._event_sink: CompositeEventSink = build_session_event_sink(
+            repository=production_task_repository if self._durable_task_id else None,
+            send_json=self._send_json_to_ws,
+            task_id=self._durable_task_id,
+            owner_id=session.owner_id,
+            run_id=self._durable_run_id,
+        )
 
         # Only create voice manager when Gemini credentials are available
         if self.runtime_config.gemini_available:
@@ -97,7 +121,7 @@ class NexusOrchestrator:
             logger.info("Using single-agent mode")
         self._runner, self._session_service = create_runner(self._agent)
         self._adk_session_id: str | None = None
-        self._user_id = f"user-{session.id}"
+        self._user_id = session.owner_id
         self._active_agent: str = "nexus_orchestrator"
 
         # Background task manager
@@ -108,7 +132,6 @@ class NexusOrchestrator:
             on_task_started=self._on_background_task_started,
             on_task_finished=self._on_background_task_finished,
         )
-        self._current_run_id = session.current_run_id
         self._current_turn_step_id: str | None = None
         self._tool_step_ids: dict[str, list[str]] = {}
 
@@ -131,7 +154,7 @@ class NexusOrchestrator:
         self._budget_stop_reason: str = ""
         self._workspace_path: str | None = None
 
-    async def initialize(self) -> None:
+    async def initialize(self, *, lazy_sandbox: bool = False) -> None:
         """Set up ADK session. Voice connection is deferred until user starts mic."""
         # Bind sandbox and bg task manager to tool context
         set_sandbox(self.session.sandbox)
@@ -140,14 +163,17 @@ class NexusOrchestrator:
         set_session_id(self.session.id)
         set_owner_id(self.session.owner_id)
         set_history_repository(self.history_repository)
+        set_production_task_repository(self.production_task_repository)
+        set_task_id(self._durable_task_id)
         set_send_json(self._send_json)
         self._bind_workspace_context()
-        workspace_root_ready = await self._ensure_session_workspace_root()
-        if not workspace_root_ready:
-            logger.warning(
-                "Continuing session %s initialization without a prepared workspace root",
-                self.session.id,
-            )
+        if not lazy_sandbox:
+            workspace_root_ready = await self._ensure_session_workspace_root()
+            if not workspace_root_ready:
+                logger.warning(
+                    "Continuing session %s initialization without a prepared workspace root",
+                    self.session.id,
+                )
 
         await self._load_integration_tools()
 
@@ -157,11 +183,7 @@ class NexusOrchestrator:
         else:
             logger.info("No Google credentials — voice disabled, text input works")
 
-        # Create ADK session
-        adk_session = await self._session_service.create_session(
-            app_name="nexus", user_id=self._user_id
-        )
-        self._adk_session_id = adk_session.id
+        await self._ensure_adk_session()
 
         # Load compact session memory so resume/continue turns stay cheap.
         if self.history_repository:
@@ -197,7 +219,7 @@ class NexusOrchestrator:
         # Notify frontend
         await self._send_json({
             "type": "sandbox_status",
-            "status": "ready",
+            "status": "ready" if self.session.sandbox.is_alive else "idle",
         })
         if self.session.stream_url:
             await self._send_json({
@@ -216,17 +238,61 @@ class NexusOrchestrator:
                 "run": self._run_payload(status=self.session.run_status),
             })
 
+    def _resolve_durable_task_id(self) -> str | None:
+        task_id = str(getattr(self.session, "task_id", "") or "").strip()
+        return task_id if task_id.startswith("task_") else None
+
+    def _resolve_durable_run_id(self) -> str | None:
+        run_id = str(getattr(self.session, "current_run_id", "") or "").strip()
+        return run_id if run_id.startswith("run_") else None
+
+    def bind_durable_run(self, *, task_id: str, run_id: str) -> None:
+        """Attach this live orchestrator to a durable task/run."""
+        self.session.task_id = task_id
+        self.session.current_run_id = run_id
+        self._current_run_id = run_id
+        self._durable_task_id = self._resolve_durable_task_id()
+        self._durable_run_id = self._resolve_durable_run_id()
+        self._event_sink = build_session_event_sink(
+            repository=self.production_task_repository if self._durable_task_id else None,
+            send_json=self._send_json_to_ws,
+            task_id=self._durable_task_id,
+            owner_id=self.session.owner_id,
+            run_id=self._durable_run_id,
+        )
+        set_task_id(self._durable_task_id)
+        self._bind_workspace_context()
+
+    async def start_desktop(self) -> None:
+        """Start or resume the sandbox because the user opened the desktop."""
+        await self._ensure_sandbox_ready("desktop")
+
     async def _load_integration_tools(self) -> None:
         """Load enabled per-user skills and MCP tools into the ADK runner."""
         if not self.history_repository:
             return
         try:
             user_settings = await self.history_repository.get_user_settings(self.session.owner_id)
-            self._skill_instruction = build_enabled_skills_prompt(user_settings)
             connections = await self.history_repository.list_enabled_integration_connections(
                 self.session.owner_id
             )
             self._integration_tools = build_mcp_adk_tools(connections)
+
+            # Extract MCP tool metadata for the skill prompt so the LLM knows
+            # which external tools are available.
+            mcp_tool_meta: list[dict[str, Any]] = []
+            for conn in connections:
+                if conn.connector_type == "mcp_remote_http" and conn.private.get("tools"):
+                    for tool_info in conn.private["tools"]:
+                        tool_name = tool_info.get("name", "")
+                        params_obj = tool_info.get("parameters") or {}
+                        props = params_obj.get("properties", {}) if isinstance(params_obj, dict) else {}
+                        param_names = ", ".join(props.keys()) if isinstance(props, dict) else ""
+                        mcp_tool_meta.append({"name": tool_name, "parameters": param_names})
+
+            self._skill_instruction = build_enabled_skills_prompt(
+                user_settings, mcp_tools=mcp_tool_meta or None
+            )
         except Exception:
             logger.warning("Failed to load integration tools for session %s", self.session.id, exc_info=True)
             self._integration_tools = []
@@ -321,9 +387,11 @@ class NexusOrchestrator:
         text: str,
         connector_ids: list[str] | None = None,
         uploaded_files: list[dict[str, Any]] | None = None,
+        emit_user_transcript: bool = True,
     ) -> None:
         """Handle direct text input (bypass voice)."""
-        await self._send_json({"type": "transcript", "role": "user", "text": text})
+        if emit_user_transcript:
+            await self._send_json({"type": "transcript", "role": "user", "text": text})
         await self._persist_message(role="user", source="typed", text=text)
         if await self._try_fast_route(
             text,
@@ -364,8 +432,9 @@ class NexusOrchestrator:
         if not settings.simple_task_fast_path:
             return False
 
-        decision = classify_request(
+        decision = await classify_request(
             text,
+            self.runtime_config,
             has_connectors=has_connectors,
             has_uploads=has_uploads,
         )
@@ -390,10 +459,7 @@ class NexusOrchestrator:
         if decision.mode == "current":
             await self._run_fast_current_lookup(text)
             return True
-        if decision.mode == "capability":
-            await self._send_capability_response()
-            return True
-        if decision.mode == "ask":
+        if decision.mode == "capability" or decision.mode == "ask":
             return await self._run_fast_answer(text, source=source)
         return False
 
@@ -410,23 +476,39 @@ class NexusOrchestrator:
                 logger.warning("Failed to send fast-path response to voice", exc_info=True)
         await self._send_json({"type": "agent_complete", "summary": answer[:200]})
 
-    async def _send_capability_response(self) -> None:
-        text = (
-            "Yes. CoComputer has native tools for Google Drive, Gmail, Google Calendar, "
-            "and Google Tasks when your Google connector is connected. I do not have a "
-            "personal Gmail account; I use your connected account through OAuth tools. "
-            "For those services I should use the native tools, not browser sign-in."
-        )
-        await self._send_agent_fast_response(text, source="capability")
-
     async def _run_fast_answer(self, text: str, *, source: str) -> bool:
         if not self.runtime_config.gemini_available:
             return False
         await self._send_json({"type": "agent_thinking", "content": "Answering directly..."})
         model = self.runtime_config.gemini_light_model or self.runtime_config.gemini_agent_model
+        
+        # Load up to 6 previous messages to give context to simple queries
+        history_text = ""
+        try:
+            from nexus.server import get_history_repository
+            history_repo = get_history_repository()
+            messages = await history_repo.get_session_messages(self.session.id)
+            if messages:
+                # Include the last 6 messages
+                recent_messages = messages[-6:]
+                history_text = "Previous conversation context:\n"
+                for msg in recent_messages:
+                    role = "User" if msg.get("role") == "user" else "Assistant"
+                    history_text += f"{role}: {msg.get('text', '')}\n"
+                history_text += "\n"
+        except Exception:
+            logger.warning("Could not load history for fast answer context", exc_info=True)
+
         prompt = (
-            "Answer the user directly and concisely. Do not use tools. "
+            "You are CoComputer, a highly capable AI agent. Answer the user directly and concisely. Do not use tools.\n\n"
+            "COCOMPUTER KNOWLEDGE:\n"
+            "- You have native tools for Google Drive, Gmail, Google Calendar, and Google Tasks.\n"
+            "- These tools are used via OAuth when the Google connector is connected.\n"
+            "- You do not have a personal account; you use the user's connected account.\n"
+            "- You have full Linux desktop control (clicking, typing, screenshots, terminal).\n"
+            "- You can write code, run commands, and create artifacts in a sandbox.\n\n"
             "If the answer needs current web information, say that a web search is needed.\n\n"
+            f"{history_text}"
             f"User: {text.strip()}"
         )
 
@@ -670,6 +752,12 @@ class NexusOrchestrator:
 
     async def handle_analyze_screen(self) -> None:
         """Take screenshot and send analysis to frontend."""
+        if not await self._ensure_sandbox_ready("screen_analysis"):
+            await self._send_json({
+                "type": "agent_screenshot",
+                "error": "Sandbox is not running and could not be started.",
+            })
+            return
         sandbox = self.session.sandbox
         screen_step_id = await self._create_step(
             step_type="system_event",
@@ -845,13 +933,114 @@ class NexusOrchestrator:
         if self.voice:
             await self.voice.close()
 
+    def has_active_agent_turn(self) -> bool:
+        """Return True while a user task is still executing."""
+        return bool(self._agent_task and not self._agent_task.done())
+
     # ── Private ────────────────────────────────────────────────
 
     _RATE_LIMIT_MAX_RETRIES = 4
     _RATE_LIMIT_BASE_WAIT = 10.0  # seconds; doubles each attempt: 10, 20, 40, 80
     _RATE_LIMIT_PATTERNS = ("429", "RESOURCE_EXHAUSTED", "quota", "rate limit", "too many requests")
+    _ADK_REPLAY_TURN_LIMIT = 15
     _RESUME_PACKET_SOFT_TOKENS = 2_000
     _RESUME_PACKET_HARD_TOKENS = 3_200
+
+    async def _ensure_adk_session(self) -> None:
+        """Reuse the stable ADK session, rebuilding it from Firestore history if absent."""
+        adk_session_id = self.session.id
+        adk_session = await self._session_service.get_session(
+            app_name="nexus",
+            user_id=self._user_id,
+            session_id=adk_session_id,
+        )
+        if adk_session is None:
+            adk_session = await self._session_service.create_session(
+                app_name="nexus",
+                user_id=self._user_id,
+                session_id=adk_session_id,
+            )
+            await self._replay_firestore_messages_into_adk(adk_session)
+
+        self._adk_session_id = adk_session.id
+
+    async def _replay_firestore_messages_into_adk(self, adk_session) -> None:
+        """Seed a newly-created ADK session with the last stored conversation turns."""
+        if not self.history_repository:
+            return
+        try:
+            messages = await self.history_repository.get_session_messages(self.session.id)
+        except Exception:
+            logger.warning("Failed to read Firestore messages for ADK replay", exc_info=True)
+            return
+
+        replay_messages = self._select_messages_for_adk_replay(
+            messages,
+            turn_limit=self._ADK_REPLAY_TURN_LIMIT,
+        )
+        for message in replay_messages:
+            event = self._message_to_adk_event(message)
+            if event is None:
+                continue
+            await self._session_service.append_event(adk_session, event)
+
+        if replay_messages:
+            logger.info(
+                "Replayed %d Firestore message(s) into ADK session %s for user %s",
+                len(replay_messages),
+                self.session.id,
+                self._user_id,
+            )
+
+    @staticmethod
+    def _select_messages_for_adk_replay(
+        messages: list[dict[str, Any]],
+        *,
+        turn_limit: int,
+    ) -> list[dict[str, Any]]:
+        normalized = [
+            message
+            for message in messages
+            if message.get("role") in {"user", "agent"} and str(message.get("text") or "").strip()
+        ]
+        if not normalized:
+            return []
+
+        selected_reversed: list[dict[str, Any]] = []
+        user_turns = 0
+        for message in reversed(normalized):
+            selected_reversed.append(message)
+            if message.get("role") == "user":
+                user_turns += 1
+                if user_turns >= turn_limit:
+                    break
+
+        return list(reversed(selected_reversed))
+
+    def _message_to_adk_event(self, message: dict[str, Any]) -> Event | None:
+        role = message.get("role")
+        text = str(message.get("text") or "").strip()
+        if not text:
+            return None
+        if role == "user":
+            author = "user"
+            content_role = "user"
+        elif role == "agent":
+            author = getattr(self._agent, "name", None) or self._active_agent or "nexus"
+            content_role = "model"
+        else:
+            return None
+
+        event_id = str(message.get("id") or message.get("turnIndex") or "")
+        return Event(
+            author=author,
+            invocation_id=f"replay-{self.session.id}",
+            id=f"firestore-{event_id}" if event_id else "",
+            content=types.Content(
+                role=content_role,
+                parts=[types.Part(text=text)],
+            ),
+        )
 
     def _is_rate_limit_error(self, exc: BaseException) -> bool:
         msg = str(exc).lower()
@@ -1013,6 +1202,8 @@ class NexusOrchestrator:
                 line += f" ({', '.join(detail_parts)})"
             if drive_link:
                 line += f" drive={drive_link}"
+            if mime_type == "application/pdf" or name.lower().endswith(".pdf") or path.lower().endswith(".pdf"):
+                line += " [PDF: use extract_pdf_text(path=...) before reading; do not cat/base64 dump it]"
             lines.append(line)
         return "\n".join(lines)
 
@@ -1097,13 +1288,13 @@ class NexusOrchestrator:
     @staticmethod
     def _format_history_context(messages: list[dict]) -> str:
         """Fallback formatter when no cached context packet exists."""
-        recent = messages[-4:]
+        recent = messages[-15:]
         lines = []
         for msg in recent:
             role = (msg.get("role") or "user").upper()
             text = str(msg.get("text") or "").strip()
             if text:
-                lines.append(f"{role}: {text[:300]}")
+                lines.append(f"{role}: {text[:1200]}")
         if not lines:
             return ""
         history = "\n".join(lines)
@@ -1116,15 +1307,15 @@ class NexusOrchestrator:
 
     def _build_local_context_packet(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
         recent_turns: list[str] = []
-        for message in messages[-4:]:
+        for message in messages[-15:]:
             role = "User" if message.get("role") == "user" else "Agent"
-            text = self._clip_text(message.get("text"), 180)
+            text = self._clip_text(message.get("text"), 1200)
             if text:
                 recent_turns.append(f"{role}: {text}")
 
         summary = ""
         for message in reversed(messages):
-            text = self._clip_text(message.get("text"), 320)
+            text = self._clip_text(message.get("text"), 1500)
             if text:
                 summary = text
                 break
@@ -1175,7 +1366,7 @@ class NexusOrchestrator:
                 compact = [str(item).strip() for item in values if str(item).strip()]
                 if compact:
                     lines.append(f"{label}:")
-                    lines.extend(f"- {item}" for item in compact[:4])
+                    lines.extend(f"- {item}" for item in compact)
         lines.append("[END CACHED SESSION CONTEXT]")
         lines.append("Continue naturally from where you left off.")
         return "\n".join(lines)
@@ -1340,6 +1531,53 @@ class NexusOrchestrator:
             })
             return False
 
+    async def _ensure_sandbox_ready(self, reason: str) -> bool:
+        """Create/resume sandbox only when a user action actually needs it."""
+        if self.session.sandbox.is_alive and self.session.stream_url:
+            if not self._sandbox_ready_reported:
+                await self._send_json({"type": "sandbox_status", "status": "ready"})
+                await self._send_json({"type": "vnc_url", "url": self.session.stream_url})
+                self._sandbox_ready_reported = True
+            return True
+
+        await self._send_json({"type": "sandbox_status", "status": "connecting", "reason": reason})
+        try:
+            if self._ensure_sandbox_ready_callback:
+                await self._ensure_sandbox_ready_callback()
+            elif not await self._reconnect_sandbox():
+                return False
+
+            set_sandbox(self.session.sandbox)
+            set_owner_id(self.session.owner_id)
+            set_history_repository(self.history_repository)
+            set_production_task_repository(self.production_task_repository)
+            set_task_id(self._durable_task_id)
+            self._bind_workspace_context()
+            workspace_root_ready = await self._ensure_session_workspace_root()
+            if not workspace_root_ready:
+                logger.warning(
+                    "Sandbox became ready for session %s without a prepared workspace root",
+                    self.session.id,
+                )
+            await self._send_json({"type": "sandbox_status", "status": "ready"})
+            if self.session.stream_url:
+                await self._send_json({"type": "vnc_url", "url": self.session.stream_url})
+            self._sandbox_ready_reported = True
+            return True
+        except Exception as exc:
+            logger.exception("Sandbox activation failed for session %s", self.session.id)
+            await self._send_json({
+                "type": "error",
+                "code": "SANDBOX_INIT_ERROR",
+                "message": str(exc),
+            })
+            await self._send_json({
+                "type": "sandbox_status",
+                "status": "error",
+                "message": str(exc),
+            })
+            return False
+
     async def _run_agent_tracked(self, message: str, *, source: str) -> None:
         """Wrap _run_agent in a cancellable task and await it."""
         if not self._ws_connected:
@@ -1350,6 +1588,9 @@ class NexusOrchestrator:
         self._turn_tool_summaries = []
         self._budget_stop_requested = False
         self._budget_stop_reason = ""
+        if not await self._ensure_sandbox_ready("agent_turn"):
+            await self._set_run_status("failed")
+            return
         await self._prepare_workspace_for_turn(message)
         self._current_turn_step_id = await self._create_step(
             step_type="agent_turn",
@@ -1618,6 +1859,14 @@ class NexusOrchestrator:
                 )
                 if step_id:
                     self._tool_step_ids.setdefault(tool_name, []).append(step_id)
+                
+                import json
+                await self._persist_message(
+                    role="tool_call",
+                    source=self._active_agent,
+                    text=f"Tool: {tool_name}\nArgs: {json.dumps(self._redact_mapping(self._coerce_mapping(tool_args)))}"
+                )
+
                 await self._send_json({
                     "type": "agent_tool_call",
                     "tool": tool_name,
@@ -1692,6 +1941,12 @@ class NexusOrchestrator:
                         output_mapping=output_mapping,
                         output_str=output_str,
                         step_id=step_id,
+                    )
+                    
+                    await self._persist_message(
+                        role="tool_result",
+                        source=tool_name,
+                        text=output_str
                     )
 
                     artifact_ref = self._extract_reference_artifact(tool_name, output_mapping, output_str)
@@ -1943,6 +2198,14 @@ class NexusOrchestrator:
             logger.warning("Failed to send WS audio frame", exc_info=True)
 
     async def _send_json(self, data: dict) -> None:
+        """Emit an orchestrator event through the configured sinks."""
+        event_sink = getattr(self, "_event_sink", None)
+        if event_sink is None:
+            await self._send_json_to_ws(data)
+            return
+        await event_sink.send(data)
+
+    async def _send_json_to_ws(self, data: dict) -> None:
         """Send JSON message to the frontend WebSocket."""
         message_type = data.get("type")
         try:
@@ -2279,23 +2542,32 @@ class NexusOrchestrator:
         )
         try:
             result = await prepare_task_workspace(task_summary)
-            if result.get("error"):
-                raise RuntimeError(str(result["error"]))
-            detail = (
-                f"Workspace ready at {result['workspace_path']}."
-                if not result.get("created")
-                else f"Created workspace at {result['workspace_path']}."
+            result_detail = result.get("detail") if isinstance(result.get("detail"), dict) else result
+            result_metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+            if result.get("status") == "error" or result.get("error"):
+                raise RuntimeError(str(result.get("summary") or result.get("error")))
+            workspace_path = (
+                result_detail.get("workspace_path")
+                or result_metadata.get("workspace_path")
+                or self._workspace_path
+                or derive_session_workspace_path(self.session.id)
             )
-            touched_files = result.get("touched_files") or []
+            touched_files = result_detail.get("touched_files") or result_metadata.get("touched_files") or []
+            created = bool(result_detail.get("created", result_metadata.get("created", False)))
+            detail = (
+                f"Created workspace at {workspace_path}."
+                if created
+                else f"Workspace ready at {workspace_path}."
+            )
             if touched_files:
                 detail += f" Updated: {', '.join(str(name) for name in touched_files)}."
             await self._complete_step(
                 step_id,
                 detail=detail,
                 metadata={
-                    "workspace_path": result.get("workspace_path"),
+                    "workspace_path": workspace_path,
                     "touched_files": touched_files,
-                    "created": bool(result.get("created")),
+                    "created": created,
                 },
             )
         except Exception as exc:
@@ -2315,15 +2587,17 @@ class NexusOrchestrator:
             result = await write_workspace_file("outputs/final.md", text, append=False)
             output_path = result.get("output_path")
             if isinstance(output_path, str) and output_path:
+                is_url = output_path.startswith(("http:", "https:", "data:"))
                 await self._create_artifact(
                     kind="workspace_output",
                     title="final.md",
                     preview=self._clip_text(text, 280),
                     source_step_id=self._current_turn_step_id,
-                    path=output_path,
+                    path=result.get("relative_path") or "outputs/final.md",
+                    url=output_path if is_url else None,
                     metadata={
                         "workspace_path": self._workspace_path or "",
-                        "workspace_relative_path": "outputs/final.md",
+                        "workspace_relative_path": result.get("relative_path") or "outputs/final.md",
                         "source": "final_response",
                     },
                 )
@@ -2487,6 +2761,13 @@ class NexusOrchestrator:
     ) -> None:
         if not self.history_repository or not self._current_run_id:
             return
+        
+        # Fail-safe: if path is a URL or data URI, move it to url
+        if path and path.startswith(("http:", "https:", "data:")):
+            if not url:
+                url = path
+            path = None
+
         try:
             artifact = await self.history_repository.create_artifact(
                 session_id=self.session.id,
@@ -2580,14 +2861,47 @@ class NexusOrchestrator:
         for key in ("path", "file_path", "output_path", "url", "download_url"):
             value = output_mapping.get(key)
             if isinstance(value, str) and value.strip():
+                is_url_val = value.startswith(("http:", "https:", "data:"))
+                
+                # Extract relative path from output_mapping if possible
+                rel_path = output_mapping.get("relative_path")
+                if not isinstance(rel_path, str) or not rel_path.strip():
+                    rel_path = value if not is_url_val else None
+
                 return {
                     "kind": "export_reference",
                     "title": tool_name.replace("_", " "),
                     "preview": self._clip_text(output_str or value, 280),
-                    "path": value if "path" in key else None,
-                    "url": value if "url" in key else None,
+                    "path": rel_path,
+                    "url": value if is_url_val else None,
                     "metadata": {"tool": tool_name, "ref_key": key},
                 }
+        for container_key in ("detail", "metadata"):
+            nested = output_mapping.get(container_key)
+            if not isinstance(nested, dict):
+                continue
+            for key in ("path", "file_path", "output_path", "url", "download_url"):
+                value = nested.get(key)
+                if isinstance(value, str) and value.strip():
+                    is_url_val = value.startswith(("http:", "https:", "data:"))
+                    
+                    # Try to get relative path from nested or output_mapping
+                    rel_path = nested.get("relative_path") or output_mapping.get("relative_path")
+                    if not isinstance(rel_path, str) or not rel_path.strip():
+                        rel_path = value if not is_url_val else None
+
+                    return {
+                        "kind": "export_reference",
+                        "title": tool_name.replace("_", " "),
+                        "preview": self._clip_text(output_str or value, 280),
+                        "path": rel_path,
+                        "url": value if is_url_val else None,
+                        "metadata": {
+                            "tool": tool_name,
+                            "ref_key": key,
+                            "ref_container": container_key,
+                        },
+                    }
         return None
 
     def _build_tool_result_metadata(

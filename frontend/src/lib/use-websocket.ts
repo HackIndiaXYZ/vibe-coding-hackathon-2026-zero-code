@@ -1,6 +1,12 @@
+/**
+ * Copyright (c) 2026 Agentic Company. All rights reserved.
+ * Proprietary and non-commercial use only.
+ */
+
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { authenticatedFetch } from "./api-client";
 import type { WsMessage, WsCommand } from "./message-types";
 
 /** Ready-state constants mirroring the WebSocket API. */
@@ -38,11 +44,73 @@ export interface UseWebSocketReturn {
 
 const MAX_RECONNECT_ATTEMPTS = 3;
 const BASE_DELAY_MS = 1000;
+const NON_RETRYABLE_CLOSE_CODES = new Set([4001, 4004, 4403, 4429]);
+
+type DurableReplayEvent = {
+  event_id?: string;
+  task_id?: string;
+  run_id?: string | null;
+  type?: string;
+  payload?: Record<string, unknown>;
+  seq?: number;
+};
+
+type DurableReplayResponse = {
+  events?: DurableReplayEvent[];
+  last_seq?: number;
+};
+
+function resolveWebSocketTarget(target: string): { url: string; protocols?: string[] } {
+  try {
+    const parsed = new URL(target);
+    const ticket = parsed.searchParams.get("ticket");
+    if (!ticket) {
+      return { url: target };
+    }
+    parsed.searchParams.delete("ticket");
+    const cleanUrl = parsed.toString();
+    return { url: cleanUrl, protocols: [ticket] };
+  } catch {
+    return { url: target };
+  }
+}
+
+function isDurableTaskId(value: string | null | undefined): value is string {
+  return typeof value === "string" && value.startsWith("task_");
+}
+
+function eventKey(message: WsMessage): string | null {
+  if (message.event_id) {
+    return `event:${message.event_id}`;
+  }
+  if (message.task_id && typeof message.seq === "number" && message.seq > 0) {
+    return `seq:${message.task_id}:${message.seq}`;
+  }
+  return null;
+}
+
+function replayEventToMessage(event: DurableReplayEvent): WsMessage | null {
+  if (!event.type) {
+    return null;
+  }
+  const payload = event.payload && typeof event.payload === "object" ? event.payload : {};
+  return {
+    ...payload,
+    type: event.type,
+    event_id: event.event_id,
+    task_id: event.task_id,
+    run_id: event.run_id ?? undefined,
+    seq: event.seq,
+  } as WsMessage;
+}
 
 /**
  * React hook for WebSocket connection management.
  */
-export function useWebSocket(url: string | null): UseWebSocketReturn {
+export function useWebSocket(
+  url: string | null,
+  durableTaskId?: string | null,
+): UseWebSocketReturn {
   const wsRef = useRef<WebSocket | null>(null);
   const [readyState, setReadyState] = useState<ReadyStateValue>(ReadyState.CLOSED);
   const [lastMessage, setLastMessage] = useState<WsMessage | null>(null);
@@ -57,10 +125,28 @@ export function useWebSocket(url: string | null): UseWebSocketReturn {
   const connectRef = useRef<(target: string) => void>(() => {});
   /** Keeps the latest url so the reconnect closure always sees it. */
   const urlRef = useRef(url);
+  const durableTaskIdRef = useRef<string | null>(
+    isDurableTaskId(durableTaskId) ? durableTaskId : null,
+  );
+  const lastSeqRef = useRef(0);
+  const seenEventKeysRef = useRef<Set<string>>(new Set());
+  const replayInFlightRef = useRef(false);
+  const replayBufferRef = useRef<WsMessage[]>([]);
+  const hasOpenedRef = useRef(false);
 
   useEffect(() => {
     urlRef.current = url;
   }, [url]);
+
+  useEffect(() => {
+    const nextTaskId = isDurableTaskId(durableTaskId) ? durableTaskId : null;
+    if (durableTaskIdRef.current !== nextTaskId) {
+      lastSeqRef.current = 0;
+      seenEventKeysRef.current.clear();
+      replayBufferRef.current = [];
+    }
+    durableTaskIdRef.current = nextTaskId;
+  }, [durableTaskId]);
 
   const clearReconnectTimer = useCallback(() => {
     if (reconnectTimer.current !== null) {
@@ -68,6 +154,54 @@ export function useWebSocket(url: string | null): UseWebSocketReturn {
       reconnectTimer.current = null;
     }
   }, []);
+
+  const dispatchJsonMessage = useCallback((message: WsMessage) => {
+    if (isDurableTaskId(message.task_id)) {
+      durableTaskIdRef.current = message.task_id;
+    }
+
+    const key = eventKey(message);
+    if (key) {
+      if (seenEventKeysRef.current.has(key)) {
+        return;
+      }
+      seenEventKeysRef.current.add(key);
+    }
+
+    if (typeof message.seq === "number" && Number.isFinite(message.seq)) {
+      lastSeqRef.current = Math.max(lastSeqRef.current, message.seq);
+    }
+
+    onJsonMessageRef.current?.(message);
+    setLastMessage(message);
+  }, []);
+
+  const flushReplayBuffer = useCallback(() => {
+    const buffered = replayBufferRef.current;
+    replayBufferRef.current = [];
+    buffered.forEach(dispatchJsonMessage);
+  }, [dispatchJsonMessage]);
+
+  const replayMissedEvents = useCallback(
+    async (taskId: string, afterSeq: number) => {
+      const response = await authenticatedFetch(
+        `/api/v1/tasks/${encodeURIComponent(taskId)}/events?after_seq=${afterSeq}`,
+      );
+      if (!response.ok) {
+        return;
+      }
+      const body = (await response.json().catch(() => null)) as DurableReplayResponse | null;
+      const replayed = Array.isArray(body?.events) ? body.events : [];
+      replayed
+        .map(replayEventToMessage)
+        .filter((message): message is WsMessage => message !== null)
+        .forEach(dispatchJsonMessage);
+      if (typeof body?.last_seq === "number" && Number.isFinite(body.last_seq)) {
+        lastSeqRef.current = Math.max(lastSeqRef.current, body.last_seq);
+      }
+    },
+    [dispatchJsonMessage],
+  );
 
   const connect = useCallback((target: string) => {
     // Tear down any existing socket first.
@@ -80,7 +214,10 @@ export function useWebSocket(url: string | null): UseWebSocketReturn {
       wsRef.current = null;
     }
 
-    const ws = new WebSocket(target);
+    const wsTarget = resolveWebSocketTarget(target);
+    const ws = wsTarget.protocols
+      ? new WebSocket(wsTarget.url, wsTarget.protocols)
+      : new WebSocket(wsTarget.url);
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
     setReadyState(ReadyState.CONNECTING);
@@ -88,6 +225,22 @@ export function useWebSocket(url: string | null): UseWebSocketReturn {
     ws.onopen = () => {
       reconnectAttempts.current = 0;
       setReadyState(ReadyState.OPEN);
+      const shouldReplay = hasOpenedRef.current && durableTaskIdRef.current !== null;
+      const replayTaskId = durableTaskIdRef.current;
+      const replayAfterSeq = lastSeqRef.current;
+      hasOpenedRef.current = true;
+
+      if (shouldReplay && replayTaskId) {
+        replayInFlightRef.current = true;
+        void replayMissedEvents(replayTaskId, replayAfterSeq)
+          .catch((error) => {
+            console.warn("[useWebSocket] Durable event replay failed:", error);
+          })
+          .finally(() => {
+            replayInFlightRef.current = false;
+            flushReplayBuffer();
+          });
+      }
 
       // Send a ping every 30 s to keep Cloud Run alive and the WS from timing out
       const pingInterval = setInterval(() => {
@@ -101,8 +254,18 @@ export function useWebSocket(url: string | null): UseWebSocketReturn {
       ws.addEventListener("close", () => clearInterval(pingInterval), { once: true });
     };
 
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       setReadyState(ReadyState.CLOSED);
+
+      if (NON_RETRYABLE_CLOSE_CODES.has(event.code)) {
+        setLastMessage({
+          type: "error",
+          code: `WS_CLOSED_${event.code}`,
+          message: event.reason || "WebSocket connection was closed.",
+        });
+        reconnectAttempts.current = MAX_RECONNECT_ATTEMPTS;
+        return;
+      }
 
       if (
         reconnectAttempts.current < MAX_RECONNECT_ATTEMPTS &&
@@ -128,14 +291,17 @@ export function useWebSocket(url: string | null): UseWebSocketReturn {
       } else if (typeof event.data === "string") {
         try {
           const parsed = JSON.parse(event.data) as WsMessage;
-          onJsonMessageRef.current?.(parsed);
-          setLastMessage(parsed);
+          if (replayInFlightRef.current) {
+            replayBufferRef.current.push(parsed);
+          } else {
+            dispatchJsonMessage(parsed);
+          }
         } catch {
           console.warn("[useWebSocket] Failed to parse text frame:", event.data);
         }
       }
     };
-  }, []);
+  }, [dispatchJsonMessage, flushReplayBuffer, replayMissedEvents]);
 
   useEffect(() => {
     connectRef.current = connect;
@@ -144,6 +310,9 @@ export function useWebSocket(url: string | null): UseWebSocketReturn {
   useEffect(() => {
     clearReconnectTimer();
     reconnectAttempts.current = 0;
+    hasOpenedRef.current = false;
+    replayInFlightRef.current = false;
+    replayBufferRef.current = [];
 
     if (url) {
       queueMicrotask(() => connect(url));

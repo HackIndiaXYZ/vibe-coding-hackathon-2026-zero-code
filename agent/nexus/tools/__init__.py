@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Agentic Company. All rights reserved.
+# Proprietary and non-commercial use only.
+
 """CoComputer agent tools — computer control primitives for ADK."""
 
 from nexus.tools.computer import (
@@ -17,11 +20,21 @@ from nexus.tools.bg_task import request_background_task
 from nexus.tools.monitor import schedule_monitoring_task
 from nexus.tools.workspace import (
     prepare_task_workspace,
+    initialize_task_state,
+    update_task_state,
+    read_task_state,
     write_todo_list,
     update_todo_item,
     write_workspace_file,
     read_workspace_file,
     list_workspace_files,
+)
+from nexus.tools.docs import (
+    extract_pdf_text,
+    generate_pdf_report,
+    generate_excel_report,
+    generate_docx_report,
+    save_as_artifact,
 )
 from nexus.tools.web import web_search, scrape_web_page
 from nexus.tools.integrations import (
@@ -34,6 +47,8 @@ from nexus.tools.integrations import (
     github_list_issues,
     github_create_issue,
     github_summarize_pr,
+    tavily_search,
+    tinyfish_web_agent,
     gmail_search,
     gmail_read,
     gmail_send,
@@ -46,6 +61,9 @@ from nexus.tools.ui_control import show_desktop_panel, show_workflow_panel
 
 ALL_TOOLS = [
     prepare_task_workspace,
+    initialize_task_state,
+    update_task_state,
+    read_task_state,
     write_todo_list,
     update_todo_item,
     write_workspace_file,
@@ -53,6 +71,11 @@ ALL_TOOLS = [
     list_workspace_files,
     web_search,
     scrape_web_page,
+    extract_pdf_text,
+    generate_pdf_report,
+    generate_excel_report,
+    generate_docx_report,
+    save_as_artifact,
     search_drive,
     read_drive_file,
     create_drive_doc,
@@ -62,6 +85,8 @@ ALL_TOOLS = [
     github_list_issues,
     github_create_issue,
     github_summarize_pr,
+    tavily_search,
+    tinyfish_web_agent,
     gmail_search,
     gmail_read,
     gmail_send,

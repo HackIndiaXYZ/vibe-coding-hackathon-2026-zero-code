@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Agentic Company. All rights reserved.
+# Proprietary and non-commercial use only.
+
 """Screenshot tool for screen observation."""
 
 from __future__ import annotations
@@ -173,6 +176,9 @@ def get_last_screenshot_b64() -> str | None:
     return img
 
 
+from nexus.tools.base import normalized_tool
+
+@normalized_tool
 def take_screenshot() -> dict:
     """Take a screenshot to see the current screen state.
 
@@ -372,6 +378,10 @@ def take_screenshot() -> dict:
 
         # Store the full image for the frontend (orchestrator picks it up)
         _last_screenshot.image = img_b64
+
+        # Clear the screen dirty flag — agent has now observed the current state
+        from nexus.tools.screen_state import clear_dirty
+        clear_dirty()
 
         return {
             "description": description,

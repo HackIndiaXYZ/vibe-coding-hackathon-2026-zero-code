@@ -1,6 +1,11 @@
+/**
+ * Copyright (c) 2026 Agentic Company. All rights reserved.
+ * Proprietary and non-commercial use only.
+ */
+
 "use client";
 
-import { useState } from "react";
+import { useState, memo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { ListTodo, Check, CircleDashed, ChevronDown, ChevronUp, X } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -16,7 +21,7 @@ interface TodoListProps {
   defaultExpanded?: boolean;
 }
 
-export function TodoList({ items, defaultExpanded = false }: TodoListProps) {
+export const TodoList = memo(function TodoList({ items, defaultExpanded = false }: TodoListProps) {
   const [isExpanded, setIsExpanded] = useState(defaultExpanded);
 
   if (!items || items.length === 0) return null;
@@ -122,4 +127,4 @@ export function TodoList({ items, defaultExpanded = false }: TodoListProps) {
       </AnimatePresence>
     </div>
   );
-}
+});
